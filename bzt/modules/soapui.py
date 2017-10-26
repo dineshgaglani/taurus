@@ -22,6 +22,56 @@ from bzt import TaurusInternalException
 from bzt.six import etree, iteritems
 from bzt.utils import BetterDict
 
+import re
+
+class PropertyComponentProvider(object):
+
+    def __init__(self, property_components):
+        self.property_components = property_components
+
+    def get_step_component(self):
+        return self.property_components[0]
+
+    def get_property_label(self):
+        #property label is the last part of the query
+        query_component = self.get_query_component()
+       
+        if(query_component.find("/") != -1 and query_component.find("[") != -1):
+            query_component = query_component[query_component.rfind("/") + 1:query_component.rfind("[")]
+
+        #Note: This If can be avoided if we get property label after create_extractor_for_transfer_type
+        if(query_component.find(":") != -1):
+            query_component = query_component[query_component.rfind(":") + 1:]
+       
+        return query_component
+
+
+class PropertyComponentProviderFactory(object):
+    
+    @staticmethod
+    def factory(property_components):
+        if(len(property_components) == 3):
+            return SoaExtractedPropertyComponentProvider(property_components)
+
+        elif(len(property_components) == 2):
+            return NonSoaExtractedPropertyComponentProvider(property_components)
+
+
+class SoaExtractedPropertyComponentProvider(PropertyComponentProvider):
+    
+    def get_config_component(self):
+        return self.property_components[1] #Only response allowed for now
+
+    def get_query_component(self):
+        return self.property_components[2]
+
+class NonSoaExtractedPropertyComponentProvider(PropertyComponentProvider):
+    
+    def get_query_component(self):
+        return self.property_components[1]
+
+    def get_config_component(self):
+        return None
 
 class SoapUIScriptConverter(object):
     NAMESPACES = dict(con="http://eviware.com/soapui/config")
@@ -30,6 +80,7 @@ class SoapUIScriptConverter(object):
         self.log = parent_log.getChild(self.__class__.__name__)
         self.tree = None
         self.interface = None
+        self.additional_extractors = None
 
     def load(self, path):
         try:
@@ -130,6 +181,47 @@ class SoapUIScriptConverter(object):
             self.log.warning("Can't find endpoint for %s:%s", interface_name, operation_name)
             return None
 
+    def parse_body_properties(self, body, target_step):
+        #\${([\w\s#//\[\]=\:';\.]+)}
+        
+        pattern = re.compile(r"\${([\w\s#//\[\]=\:';\.]+)}")
+        iterator = pattern.finditer(body)
+
+        self.additional_extractors = BetterDict()
+
+        for match in iterator:
+            property_components = match.group(1).split("#")
+
+            property_component_provider = PropertyComponentProviderFactory.factory(property_components)
+
+            if(isinstance(property_component_provider, SoaExtractedPropertyComponentProvider)): #Remove this condition to support non-soa type property transfers 
+                source_step_component = property_component_provider.get_step_component()
+                source_config_component = property_component_provider.get_config_component() #should be response, because JMETER cannot create extractors for request
+                source_query_component = property_component_provider.get_query_component() #This is the xPathQuery
+                source_property_label = property_component_provider.get_property_label()
+
+                self.log.warning("Found property with SourceStepName (%s), sourceComponent (%s), xpath (%s)", source_step_component, source_config_component, source_query_component)
+
+                extractor_for_this_input = self.create_extractor_for_transfer_type("XPATH", source_property_label, source_step_component, source_query_component)
+                #Add to class level extractors
+                self.add_property_extractor(extractor_for_this_input)
+
+                #replace property in body with property
+                body = self.edit_body_with_property_label(body, match.group(1), source_property_label)
+                self.log.debug("Replaced body : %s", body)
+
+            else:
+                #non-soa extracted are traditional property transfers, the property transfer step name needs to be removed 
+                source_property_label = property_component_provider.get_property_label()
+                body = self.edit_body_with_property_label(body, match.group(1), source_property_label)
+
+        return body
+
+    def edit_body_with_property_label(self, body, regex_match, source_property_label):
+        self.log.info ("Replacing %s with %s in body", regex_match, source_property_label)
+        return body.replace(regex_match, source_property_label)
+
+
     def _extract_soap_request(self, test_step):
         label = test_step.get('name')
         config = test_step.find('./con:config', namespaces=self.NAMESPACES)
@@ -153,9 +245,14 @@ class SoapUIScriptConverter(object):
         }
 
         if body:
+            body = self.parse_body_properties(body, test_step)
             request["body"] = body
 
         return request
+
+    def add_property_extractor(self, property_extractor):
+        self.log.debug("adding property extractor (%s) ", str(property_extractor))
+        self.additional_extractors.merge(property_extractor)
 
     def _calc_base_address(self, test_step):
         config = test_step.find('./con:config', namespaces=self.NAMESPACES)
@@ -271,10 +368,16 @@ class SoapUIScriptConverter(object):
 
         target_step_type = target_step.get("type")
         if target_step_type != "properties":
-            self.log.warning("Unsupported target step type for Property Transfer (%s). Skipping", target_step_type)
+            self.log.warning("Unsupported target step type for Property Transfer (%s). Only transfers to property steps allowed. Skipping", target_step_type)
             return False
 
         return True
+
+    def strip_namespace_from_xpath(self, xpath):
+        if(xpath):
+            xpath = xpath[xpath.rfind("//"):]
+            xpath = "/" + re.sub(r"(\/\/|\/)(.+?:)", "/", xpath, 0)
+        return xpath
 
     def _extract_transfer(self, transfer):
         source_type = transfer.findtext('./con:sourceType', namespaces=self.NAMESPACES)
@@ -290,6 +393,14 @@ class SoapUIScriptConverter(object):
         if not self._validate_transfer(source_type, source_step_name, transfer_type, target_step_name):
             return None
 
+        extracted_property = self.create_extractor_for_transfer_type(transfer_type, target_prop, source_step_name, query)
+
+        self.log.debug("Extracted property (%s)", extracted_property)
+
+        return extracted_property
+        
+        
+    def create_extractor_for_transfer_type(self, transfer_type, target_prop, source_step_name, query):
         extractor = BetterDict()
         if transfer_type == "JSONPATH":
             extractor.merge({
@@ -301,6 +412,7 @@ class SoapUIScriptConverter(object):
                 }
             })
         elif transfer_type == "XPATH":
+            query = self.strip_namespace_from_xpath(query)
             extractor.merge({
                 'extract-xpath': {
                     target_prop: {
@@ -309,6 +421,7 @@ class SoapUIScriptConverter(object):
                     }
                 }
             })
+
         return {source_step_name: extractor}
 
     def _extract_property_transfers(self, test_step):
@@ -340,6 +453,9 @@ class SoapUIScriptConverter(object):
                 request = self._extract_rest_request(step)
             elif step.get("type") == "request":
                 request = self._extract_soap_request(step)
+                if self.additional_extractors:
+                    extractors.merge(self.additional_extractors)
+                    additional_extractors = BetterDict()
             elif step.get("type") == "properties":
                 config_block = step.find('./con:config', namespaces=self.NAMESPACES)
                 if config_block is not None:
@@ -349,8 +465,6 @@ class SoapUIScriptConverter(object):
                 extracted_extractors = self._extract_property_transfers(step)  # label -> extractor
                 if extracted_extractors:
                     extractors.merge(extracted_extractors)
-            elif step.get("type") == "groovy":
-                request = self._extract_script(step)
 
             if request is not None:
                 requests.append(request)
@@ -368,22 +482,6 @@ class SoapUIScriptConverter(object):
             scenario["variables"] = variables
 
         return scenario
-
-    def _extract_script(self, test_step):
-        label = test_step.get("name", "Script")
-        script = test_step.find('./con:config/script', namespaces=self.NAMESPACES).text
-        if script is not None:
-            script = script.strip()
-            return {
-                "label": label,
-                "action": "pause",
-                "target": "current-thread",
-                "pause-duration": "0ms",
-                "jsr223": [{
-                    "language": "groovy",
-                    "script-text": script,
-                }]
-            }
 
     def _extract_test_case(self, test_case, test_suite, suite_level_props):
         case_name = test_case.get("name")
